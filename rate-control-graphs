@@ -1,0 +1,663 @@
+%% 802.11 Dynamic Rate Control Simulation
+%
+% This example shows dynamic rate control by varying the Modulation and
+% Coding scheme (MCS) of successive packets transmitted over a frequency
+% selective multipath fading channel.
+% Modified to compare default and Minstrel algorithms
+
+% Copyright 2016-2022 The MathWorks, Inc.
+
+% Set random stream for repeatability of results
+originalStream = rng(21);
+
+%% Setup common parameters
+numPackets = 1000; % Number of packets transmitted during the simulation 
+walkSNR = true; 
+
+% Select SNR for the simulation
+if walkSNR
+    meanSNR = 30;   % Mean SNR
+    amplitude = 16; % Variation in SNR around the average mean SNR value
+    % Generate varying SNR values for each transmitted packet
+    baseSNR = sin(linspace(1,10,numPackets))*amplitude+meanSNR;
+    % The maxJump controls the maximum SNR difference between one
+    % packet and the next 
+    maxJump = 0.05;
+else
+    % Fixed mean SNR value for each transmitted packet. All the variability
+    % in SNR comes from a time varying radio channel
+end
+
+% To plot the equalized constellation for each spatial stream set
+% displayConstellation to false (no need for both algorithms)
+displayConstellation = false;
+if displayConstellation
+    ConstellationDiagram = comm.ConstellationDiagram;
+    ConstellationDiagram.ShowGrid = true;
+    ConstellationDiagram.Name = 'Equalized data symbols';
+end
+
+%% Run the simulation for the default algorithm
+fprintf('Running simulation with default SNR-based algorithm...\n');
+[defaultBER, defaultPacketLength, defaultSNRMeasured, defaultMCS, cfgVHT, throughputDefault] = runSimulation('default', numPackets, walkSNR, baseSNR, maxJump, displayConstellation);
+
+% Reset the random stream to ensure the same channel conditions for the Minstrel algorithm
+rng(21);
+
+%% Run the simulation for the Minstrel algorithm
+fprintf('Running simulation with Minstrel algorithm...\n');
+[minstrelBER, minstrelPacketLength, minstrelSNRMeasured, minstrelMCS, ~, throughputMinstrel] = runSimulation('minstrel', numPackets, walkSNR, baseSNR, maxJump, displayConstellation);
+
+%% Plot comparison
+plotComparisonResults(defaultBER, defaultPacketLength, defaultSNRMeasured, defaultMCS, ...
+                     minstrelBER, minstrelPacketLength, minstrelSNRMeasured, minstrelMCS, ...
+                     cfgVHT, throughputDefault, throughputMinstrel);
+
+% Restore original stream
+rng(originalStream);
+
+%% Simulation function to run each algorithm
+function [ber, packetLength, snrMeasured, MCS, cfgVHT, throughput] = runSimulation(algoType, numPackets, walkSNR, baseSNR, maxJump, displayConstellation)
+    % Initialize common configuration
+    cfgVHT = wlanVHTConfig;         
+    cfgVHT.ChannelBandwidth = 'CBW40'; % 40 MHz channel bandwidth
+    cfgVHT.MCS = 1;                    % QPSK rate-1/2
+    cfgVHT.APEPLength = 4096;          % APEP length in bytes
+    
+    % Setup channel
+    tgacChannel = wlanTGacChannel;
+    tgacChannel.DelayProfile = 'Model-D';
+    tgacChannel.ChannelBandwidth = cfgVHT.ChannelBandwidth;
+    tgacChannel.NumTransmitAntennas = 1;
+    tgacChannel.NumReceiveAntennas = 1;
+    tgacChannel.TransmitReceiveDistance = 20; % Distance in meters for NLOS
+    tgacChannel.RandomStream = 'mt19937ar with seed';
+    tgacChannel.Seed = 0;
+    tgacChannel.NormalizeChannelOutputs = false;
+    
+    % Set the sampling rate for the channel
+    sr = wlanSampleRate(cfgVHT);
+    tgacChannel.SampleRate = sr;
+    
+    % Default SNR-based algorithm parameters
+    rcaAttack = 1;  % Control the sensitivity when MCS is increasing
+    rcaRelease = 0; % Control the sensitivity when MCS is decreasing
+    threshold = [11 14 19 20 25 28 30 31 35]; 
+    snrUp = [threshold inf]+rcaAttack;
+    snrDown = [-inf threshold]-rcaRelease;
+    snrInd = cfgVHT.MCS; % Store the start MCS value
+    
+    % Minstrel algorithm parameters
+    if strcmp(algoType, 'minstrel')
+        minstrelStats = initializeMinstrel();
+    end
+    
+    % Initial SNR value
+    if walkSNR
+        snrWalk = baseSNR(1);
+    else
+        snrWalk = 22;
+    end
+    
+    % Define simulation variables
+    snrMeasured = zeros(1, numPackets);
+    MCS = zeros(1, numPackets);
+    ber = zeros(1, numPackets);
+    packetLength = zeros(1, numPackets);
+    
+    % For ConstellationDiagram (if enabled)
+    if displayConstellation
+        ConstellationDiagram = comm.ConstellationDiagram;
+        ConstellationDiagram.ShowGrid = true;
+        ConstellationDiagram.Name = ['Equalized data symbols - ' algoType];
+    end
+    
+    % Main simulation loop
+    for numPkt = 1:numPackets 
+        if walkSNR
+            % Generate SNR value per packet using random walk algorithm biased
+            % towards the mean SNR
+            snrWalk = 0.9*snrWalk+0.1*baseSNR(numPkt)+rand(1)*maxJump*2-maxJump;
+        end
+        
+        % Generate a single packet waveform
+        txPSDU = randi([0,1],8*cfgVHT.PSDULength,1,'int8');
+        txWave = wlanWaveformGenerator(txPSDU,cfgVHT,'IdleTime',5e-4);
+        
+        % Receive processing, including SNR estimation
+        y = processPacket(txWave,snrWalk,tgacChannel,cfgVHT);
+        
+        % Plot equalized symbols of data carrying subcarriers
+        if displayConstellation && ~isempty(y.EstimatedSNR)
+            release(ConstellationDiagram);
+            ConstellationDiagram.ReferenceConstellation = wlanReferenceSymbols(cfgVHT);
+            ConstellationDiagram.Title = ['Packet ' int2str(numPkt) ' - ' algoType];
+            ConstellationDiagram(y.EqDataSym(:));
+            drawnow 
+        end
+        
+        % Store estimated SNR value for each packet
+        if isempty(y.EstimatedSNR) 
+            snrMeasured(1,numPkt) = NaN;
+        else
+            snrMeasured(1,numPkt) = y.EstimatedSNR;
+        end
+        
+        % Determine the length of the packet in seconds including idle time
+        packetLength(numPkt) = y.RxWaveformLength/sr;
+        success = true;
+        
+        % Calculate packet error rate (PER)
+        if isempty(y.RxPSDU)
+            % Set the PER of an undetected packet to NaN
+            ber(numPkt) = NaN;
+        else
+            [numErrors, ber(numPkt)] = biterr(y.RxPSDU, txPSDU);
+            if numErrors > 0
+                success = false;
+            end
+        end
+
+        % Store current MCS value
+        MCS(numPkt) = cfgVHT.MCS;
+        
+        % Update MCS for next packet based on algorithm type
+        if strcmp(algoType, 'default')
+            % Default SNR-based algorithm
+            increaseMCS = (mean(y.EstimatedSNR) > snrUp((snrInd==0)+snrInd));
+            decreaseMCS = (mean(y.EstimatedSNR) <= snrDown((snrInd==0)+snrInd));
+            snrInd = snrInd+increaseMCS-decreaseMCS;
+            cfgVHT.MCS = max(0, min(9, snrInd-1)); % Ensure MCS is in valid range
+        else
+            % Minstrel algorithm
+            [newMCS, newStats] = minstrelRateControl(success, minstrelStats, cfgVHT.MCS, mean(y.EstimatedSNR));
+            minstrelStats = newStats;
+            cfgVHT.MCS = newMCS;
+        end
+    end
+    
+    % Calculate throughput
+    windowLength = 3; % Length of the averaging window
+    throughput = movsum(8*cfgVHT.APEPLength.*(ber==0),windowLength)./movsum(packetLength,windowLength)/1e6;
+    
+    % Display results
+    fprintf('\n%s Algorithm Results:\n', algoType);
+    fprintf('Overall data rate: %.2f Mbps\n', 8*cfgVHT.APEPLength*(numPackets-sum(ber > 0))/sum(packetLength)/1e6);
+    fprintf('Overall packet error rate: %.4f\n', sum(ber > 0)/numPackets);
+end
+
+%% Initialize Minstrel statistics structure
+function minstrelStats = initializeMinstrel()
+    % Editable parameters
+    minstrelStats.ewmaLevel = 0.75;
+    minstrelStats.updateInterval = 10;
+    minstrelStats.histReset = 40;
+    
+    % Defaults
+    minstrelStats.availableMCS = 0:9; % what we have in 802.11ac
+    minstrelStats.bitrates = [11, 18, 24, 28, 34, 38, 39, 41, 43, 44]; % MCS bitrates
+    
+    minstrelStats.attempts = zeros(1, length(minstrelStats.availableMCS));
+    minstrelStats.success = zeros(1, length(minstrelStats.availableMCS));
+    minstrelStats.succProb = 0.1 * ones(1, length(minstrelStats.availableMCS));
+    minstrelStats.ewma = 0.1 * ones(1, length(minstrelStats.availableMCS));
+    minstrelStats.throughput = zeros(1, length(minstrelStats.availableMCS));
+    
+    minstrelStats.maxJump = 4;
+    minstrelStats.chainIndex = 1; 
+    minstrelStats.retryChain = [0, 0, 0, 0];
+    
+    minstrelStats.packetCount = 0;
+end
+
+%% Process packet function
+function Y = processPacket(txWave, snrWalk, tgacChannel, cfgVHT)
+    % Pass the transmitted waveform through the channel, perform
+    % receiver processing, and SNR estimation.
+    
+    chanBW = cfgVHT.ChannelBandwidth; % Channel bandwidth
+    % Set the following parameters to empty for an undetected packet
+    estimatedSNR = [];
+    eqDataSym = [];
+    noiseVarVHT = [];
+    rxPSDU = [];
+    
+    % Get the OFDM info
+    ofdmInfo = wlanVHTOFDMInfo('VHT-Data',cfgVHT);
+    
+    % Pass the waveform through the fading channel model
+    rxWave = tgacChannel(txWave);
+    
+    % Account for noise energy in nulls so the SNR is defined per
+    % active subcarrier
+    packetSNR = snrWalk-10*log10(ofdmInfo.FFTLength/ofdmInfo.NumTones);
+    
+    % Add noise
+    rxWave = awgn(rxWave,packetSNR);
+    rxWaveformLength = size(rxWave,1); % Length of the received waveform
+    
+    % Recover packet
+    ind = wlanFieldIndices(cfgVHT); % Get field indices
+    pktOffset = wlanPacketDetect(rxWave,chanBW); % Detect packet
+    
+    if ~isempty(pktOffset) % If packet detected
+        % Extract the L-LTF field for fine timing synchronization
+        LLTFSearchBuffer = rxWave(pktOffset+(ind.LSTF(1):ind.LSIG(2)),:);
+    
+        % Start index of L-LTF field
+        finePktOffset = wlanSymbolTimingEstimate(LLTFSearchBuffer,chanBW);
+     
+        % Determine final packet offset
+        pktOffset = pktOffset+finePktOffset;
+        
+        if pktOffset<15 % If synchronization successful
+            % Extract VHT-LTF samples from the waveform, demodulate and
+            % perform channel estimation
+            VHTLTF = rxWave(pktOffset+(ind.VHTLTF(1):ind.VHTLTF(2)),:);
+            demodVHTLTF = wlanVHTLTFDemodulate(VHTLTF,cfgVHT);
+            [chanEstVHTLTF,chanEstSSPilots] = wlanVHTLTFChannelEstimate(demodVHTLTF,cfgVHT);
+            
+            % Extract VHT data field
+            vhtdata = rxWave(pktOffset+(ind.VHTData(1):ind.VHTData(2)),:);
+            
+            % Estimate the noise power in VHT data field
+            noiseVarVHT = vhtNoiseEstimate(vhtdata,chanEstSSPilots,cfgVHT);
+            
+            % Recover equalized symbols at data carrying subcarriers using
+            % channel estimates from VHT-LTF
+            [rxPSDU,~,eqDataSym] = wlanVHTDataRecover(vhtdata,chanEstVHTLTF,noiseVarVHT,cfgVHT);
+            
+            % SNR estimation per receive antenna
+            powVHTLTF = mean(VHTLTF.*conj(VHTLTF));
+            estSigPower = powVHTLTF-noiseVarVHT;
+            estimatedSNR = 10*log10(mean(estSigPower./noiseVarVHT));
+        end
+    end
+    
+    % Set output
+    Y = struct( ...
+        'RxPSDU',           rxPSDU, ...
+        'EqDataSym',        eqDataSym, ...
+        'RxWaveformLength', rxWaveformLength, ...
+        'NoiseVar',         noiseVarVHT, ...
+        'EstimatedSNR',     estimatedSNR);
+end
+
+%% Minstrel rate control algorithm
+function [newMCS, minstrelStats] = minstrelRateControl(success, minstrelStats, prevMCS, estimatedSNR)
+    % Perform the periodic update of EWMA table if necessary
+    if mod(minstrelStats.packetCount, minstrelStats.updateInterval) == 0
+        bestProbability = -1;
+        bestProbabilityIndex = 1;
+        
+        % Go through every MCS we have
+        for i = 1:length(minstrelStats.availableMCS)
+            if minstrelStats.attempts(i) > 0
+                currentProbability = minstrelStats.success(i) / minstrelStats.attempts(i);
+                
+                minstrelStats.ewma(i) = (minstrelStats.ewmaLevel * minstrelStats.ewma(i) ...
+                    + (1 - minstrelStats.ewmaLevel) * currentProbability);
+                
+                % Check best probability
+                if minstrelStats.ewma(i) >= bestProbability
+                    bestProbability = minstrelStats.ewma(i);
+                    bestProbabilityIndex = i;
+                end
+                
+                % Reset at the end
+                if mod(minstrelStats.packetCount, minstrelStats.histReset) == 0
+                    minstrelStats.attempts(i) = 0;
+                    minstrelStats.success(i) = 0;
+                    minstrelStats.packetCount = 0;
+                end
+            end
+        end
+        
+        % Recalculate throughput for each
+        minstrelStats.throughput = minstrelStats.bitrates .* minstrelStats.ewma;
+        
+        % Now we want to construct the chain
+        % First find best throughput
+        [~, sortedIndices] = sort(minstrelStats.throughput, 'descend');
+        
+        bestThroughput = minstrelStats.bitrates(sortedIndices(1));
+        bestThroughputIndex = sortedIndices(1) - 1;
+        
+        % Dora the explorer packet
+        % Pick random, if better than throughput insert it higher
+        random_mcs = randi([1, min(bestThroughputIndex + minstrelStats.maxJump, 10)]);
+        random_rate = minstrelStats.bitrates(random_mcs);
+        
+        if random_rate > bestThroughput && minstrelStats.chainIndex < 2 % If we crashed, let's not immediately try again
+            % random, Best throughput, best probs, then safest
+            minstrelStats.retryChain = [(random_mcs - 1), bestThroughputIndex, (bestProbabilityIndex - 1), max(bestThroughputIndex - minstrelStats.maxJump, 0)];
+        else
+            % Best throughput, random, best probs, then safest
+            minstrelStats.retryChain = [bestThroughputIndex, (random_mcs - 1), (bestProbabilityIndex - 1), max(bestThroughputIndex - minstrelStats.maxJump, 0)];
+        end
+        
+        % Reset retry chain position
+        minstrelStats.chainIndex = 1;
+    end
+    
+    % Update statistics
+    minstrelStats.attempts(prevMCS + 1) = minstrelStats.attempts(prevMCS + 1) + 1;
+    if success 
+        minstrelStats.success(prevMCS + 1) = minstrelStats.success(prevMCS + 1) + 1;
+    end
+    
+    % Continue along chain - if fail, move lower if possible
+    if ~success && minstrelStats.chainIndex < 4
+        minstrelStats.chainIndex = minstrelStats.chainIndex + 1;
+    end
+    
+    % Update packet count and get new MCS
+    minstrelStats.packetCount = minstrelStats.packetCount + 1;
+    newMCS = minstrelStats.retryChain(minstrelStats.chainIndex);
+    
+    % Ensure MCS is in valid range (0-9)
+    newMCS = max(0, min(9, newMCS));
+end
+
+%% Plot comparison results
+function plotComparisonResults(defaultBER, defaultPacketLength, defaultSNRMeasured, defaultMCS, ...
+                              minstrelBER, minstrelPacketLength, minstrelSNRMeasured, minstrelMCS, ...
+                              cfgVHT, throughputDefault, throughputMinstrel)
+    figure('Outerposition',[50 50 1200 800])
+    
+    % MCS Comparison
+    subplot(4,2,[1,2]);
+    plot(defaultMCS, 'b-', 'LineWidth', 1.5);
+    hold on;
+    plot(minstrelMCS, 'r-', 'LineWidth', 1.5);
+    xlabel('Packet Number');
+    ylabel('MCS');
+    title('MCS Selection Comparison');
+    legend('Default Algorithm', 'Minstrel Algorithm', 'Location', 'best');
+    grid on;
+    
+    % SNR Comparison
+    subplot(4,2,3);
+    plot(defaultSNRMeasured, 'b-', 'LineWidth', 1.5);
+    xlabel('Packet Number');
+    ylabel('SNR (dB)');
+    title('Estimated SNR - Default');
+    grid on;
+    
+    subplot(4,2,4);
+    plot(minstrelSNRMeasured, 'r-', 'LineWidth', 1.5);
+    xlabel('Packet Number');
+    ylabel('SNR (dB)');
+    title('Estimated SNR - Minstrel');
+    grid on;
+    
+    % BER Comparison
+    subplot(4,2,5);
+    plot(find(defaultBER==0), defaultBER(defaultBER==0), 'bx');
+    hold on;
+    stem(find(defaultBER>0), defaultBER(defaultBER>0), 'or');
+    xlabel('Packet Number');
+    ylabel('BER');
+    title('Bit Error Rate - Default');
+    if any(defaultBER)
+        legend('Successful decode', 'Unsuccessful decode', 'Location', 'best');
+    else
+        legend('Successful decode', 'Location', 'best');
+    end
+    grid on;
+    
+    subplot(4,2,6);
+    plot(find(minstrelBER==0), minstrelBER(minstrelBER==0), 'bx');
+    hold on;
+    stem(find(minstrelBER>0), minstrelBER(minstrelBER>0), 'or');
+    xlabel('Packet Number');
+    ylabel('BER');
+    title('Bit Error Rate - Minstrel');
+    if any(minstrelBER)
+        legend('Successful decode', 'Unsuccessful decode', 'Location', 'best');
+    else
+        legend('Successful decode', 'Location', 'best');
+    end
+    grid on;
+    
+    % Throughput Comparison
+    subplot(4,2,7);
+    plot(throughputDefault, 'b-', 'LineWidth', 1.5);
+    xlabel('Packet Number');
+    ylabel('Mbps');
+    title('Throughput - Default');
+    grid on;
+    
+    subplot(4,2,8);
+    plot(throughputMinstrel, 'r-', 'LineWidth', 1.5);
+    xlabel('Packet Number');
+    ylabel('Mbps');
+    title('Throughput - Minstrel');
+    grid on;
+    
+    % Create a separate figure for direct comparison
+    figure('Outerposition',[50 550 900 400])
+    windowLength = 30; % Wider window for smoother comparison
+    defaultAvgThroughput = movmean(throughputDefault, windowLength);
+    minstrelAvgThroughput = movmean(throughputMinstrel, windowLength);
+    
+    plot(defaultAvgThroughput, 'b-', 'LineWidth', 2);
+    hold on;
+    plot(minstrelAvgThroughput, 'r-', 'LineWidth', 2);
+    xlabel('Packet Number');
+    ylabel('Mbps');
+    title(['Throughput Comparison (Moving Average, Window = ' num2str(windowLength) ' packets)']);
+    legend('Default Algorithm', 'Minstrel Algorithm', 'Location', 'best');
+    grid on;
+    
+    % Print statistics comparison
+    defaultSuccessRate = sum(defaultBER == 0) / length(defaultBER) * 100;
+    minstrelSuccessRate = sum(minstrelBER == 0) / length(minstrelBER) * 100;
+    
+    defaultAvgRate = 8*cfgVHT.APEPLength*(sum(defaultBER==0))/sum(defaultPacketLength)/1e6;
+    minstrelAvgRate = 8*cfgVHT.APEPLength*(sum(minstrelBER==0))/sum(minstrelPacketLength)/1e6;
+    
+    fprintf('\n----- Performance Comparison -----\n');
+    fprintf('Default Algorithm:  Success Rate = %.2f%%, Average Throughput = %.2f Mbps\n', ...
+           defaultSuccessRate, defaultAvgRate);
+    fprintf('Minstrel Algorithm: Success Rate = %.2f%%, Average Throughput = %.2f Mbps\n', ...
+           minstrelSuccessRate, minstrelAvgRate);
+    
+    if minstrelAvgRate > defaultAvgRate
+        improvement = (minstrelAvgRate / defaultAvgRate - 1) * 100;
+        fprintf('Minstrel outperforms default by %.2f%%\n', improvement);
+    else
+        reduction = (1 - minstrelAvgRate / defaultAvgRate) * 100;
+        fprintf('Minstrel underperforms default by %.2f%%\n', reduction);
+    end
+end
+
+function plotExtendedComparison(defaultBER, defaultMCS, defaultSNRMeasured, throughputDefault, ...
+                              minstrelBER, minstrelMCS, minstrelSNRMeasured, throughputMinstrel, ...
+                              cfgVHT)
+    % Calculate average bit error rate (including only failed packets)
+    defaultFailedPackets = defaultBER(defaultBER > 0);
+    minstrelFailedPackets = minstrelBER(minstrelBER > 0);
+    
+    defaultAvgBER = mean(defaultFailedPackets);
+    minstrelAvgBER = mean(minstrelFailedPackets);
+    
+    % Calculate packet error rates
+    defaultPER = sum(defaultBER > 0) / length(defaultBER);
+    minstrelPER = sum(minstrelBER > 0) / length(minstrelBER);
+    
+    % Print extended statistics
+    fprintf('\n----- Extended Statistics -----\n');
+    fprintf('Default Algorithm:  Packet Error Rate = %.4f, Average Bit Error Rate (failed packets) = %.4f\n', ...
+           defaultPER, defaultAvgBER);
+    fprintf('Minstrel Algorithm: Packet Error Rate = %.4f, Average Bit Error Rate (failed packets) = %.4f\n', ...
+           minstrelPER, minstrelAvgBER);
+    
+    % Calculate throughput per SNR value
+    % Create SNR bins from 5 to 40 dB with 1 dB steps
+    snrBins = 5:1:40;
+    binWidth = 1; % 1 dB bin width
+    
+    % Initialize arrays to store throughput per SNR
+    defaultThroughputPerSNR = zeros(size(snrBins));
+    minstrelThroughputPerSNR = zeros(size(snrBins));
+    defaultCountPerSNR = zeros(size(snrBins));
+    minstrelCountPerSNR = zeros(size(snrBins));
+    
+    % Process default algorithm data
+    for i = 1:length(defaultSNRMeasured)
+        if ~isnan(defaultSNRMeasured(i))
+            % Find the closest SNR bin
+            [~, binIdx] = min(abs(snrBins - defaultSNRMeasured(i)));
+            defaultThroughputPerSNR(binIdx) = defaultThroughputPerSNR(binIdx) + throughputDefault(i);
+            defaultCountPerSNR(binIdx) = defaultCountPerSNR(binIdx) + 1;
+        end
+    end
+    
+    % Process Minstrel algorithm data
+    for i = 1:length(minstrelSNRMeasured)
+        if ~isnan(minstrelSNRMeasured(i))
+            % Find the closest SNR bin
+            [~, binIdx] = min(abs(snrBins - minstrelSNRMeasured(i)));
+            minstrelThroughputPerSNR(binIdx) = minstrelThroughputPerSNR(binIdx) + throughputMinstrel(i);
+            minstrelCountPerSNR(binIdx) = minstrelCountPerSNR(binIdx) + 1;
+        end
+    end
+    
+    % Calculate average throughput per SNR bin
+    for i = 1:length(snrBins)
+        if defaultCountPerSNR(i) > 0
+            defaultThroughputPerSNR(i) = defaultThroughputPerSNR(i) / defaultCountPerSNR(i);
+        end
+        if minstrelCountPerSNR(i) > 0
+            minstrelThroughputPerSNR(i) = minstrelThroughputPerSNR(i) / minstrelCountPerSNR(i);
+        end
+    end
+    
+    % Plot throughput vs SNR for both algorithms
+    figure('Outerposition',[50 150 900 600])
+    
+    % Plot throughput vs SNR
+    subplot(2,1,1);
+    plot(snrBins, defaultThroughputPerSNR, 'b-o', 'LineWidth', 1.5, 'MarkerSize', 6);
+    hold on;
+    plot(snrBins, minstrelThroughputPerSNR, 'r-s', 'LineWidth', 1.5, 'MarkerSize', 6);
+    xlabel('SNR (dB)');
+    ylabel('Average Throughput (Mbps)');
+    title('Throughput vs SNR Comparison');
+    legend('Default Algorithm', 'Minstrel Algorithm', 'Location', 'northwest');
+    grid on;
+    
+    % Plot packet count per SNR bin (to show data density)
+    subplot(2,1,2);
+    bar(snrBins, [defaultCountPerSNR; minstrelCountPerSNR]', 'grouped');
+    xlabel('SNR (dB)');
+    ylabel('Number of Packets');
+    title('Packet Distribution Across SNR Values');
+    legend('Default Algorithm', 'Minstrel Algorithm', 'Location', 'northwest');
+    grid on;
+    
+    % Create a figure for MCS usage comparison
+    figure('Outerposition',[50 750 900 400])
+    
+    % Calculate MCS usage frequency
+    defaultMCSHist = histcounts(defaultMCS, -0.5:1:9.5);
+    minstrelMCSHist = histcounts(minstrelMCS, -0.5:1:9.5);
+    
+    % Normalize to percentage
+    defaultMCSPercent = defaultMCSHist / sum(defaultMCSHist) * 100;
+    minstrelMCSPercent = minstrelMCSHist / sum(minstrelMCSHist) * 100;
+    
+    % Plot MCS usage frequency
+    bar(0:9, [defaultMCSPercent; minstrelMCSPercent]', 'grouped');
+    xlabel('MCS Value');
+    ylabel('Usage Percentage (%)');
+    title('MCS Selection Frequency Comparison');
+    legend('Default Algorithm', 'Minstrel Algorithm', 'Location', 'best');
+    grid on;
+    
+    % Calculate MCS efficiency (throughput per MCS)
+    defaultMCSEff = zeros(10, 1);  % For MCS 0-9
+    minstrelMCSEff = zeros(10, 1); % For MCS 0-9
+    defaultMCSCount = zeros(10, 1);
+    minstrelMCSCount = zeros(10, 1);
+    
+    % Process default algorithm
+    for i = 1:length(defaultMCS)
+        mcsValue = defaultMCS(i) + 1;  % +1 for 1-based indexing
+        defaultMCSEff(mcsValue) = defaultMCSEff(mcsValue) + throughputDefault(i);
+        defaultMCSCount(mcsValue) = defaultMCSCount(mcsValue) + 1;
+    end
+    
+    % Process Minstrel algorithm
+    for i = 1:length(minstrelMCS)
+        mcsValue = minstrelMCS(i) + 1;  % +1 for 1-based indexing
+        minstrelMCSEff(mcsValue) = minstrelMCSEff(mcsValue) + throughputMinstrel(i);
+        minstrelMCSCount(mcsValue) = minstrelMCSCount(mcsValue) + 1;
+    end
+    
+    % Calculate average throughput per MCS
+    for i = 1:10
+        if defaultMCSCount(i) > 0
+            defaultMCSEff(i) = defaultMCSEff(i) / defaultMCSCount(i);
+        end
+        if minstrelMCSCount(i) > 0
+            minstrelMCSEff(i) = minstrelMCSEff(i) / minstrelMCSCount(i);
+        end
+    end
+    
+    % Create figure for MCS efficiency
+    figure('Outerposition',[950 750 900 400])
+    bar(0:9, [defaultMCSEff, minstrelMCSEff], 'grouped');
+    xlabel('MCS Value');
+    ylabel('Average Throughput (Mbps)');
+    title('Average Throughput per MCS Value');
+    legend('Default Algorithm', 'Minstrel Algorithm', 'Location', 'best');
+    grid on;
+    
+    % Print additional comparison
+    fprintf('\n----- MCS Usage and Efficiency -----\n');
+    fprintf('MCS\tDefault%%\tMinstrel%%\tDefault-Mbps\tMinstrel-Mbps\n');
+    for i = 0:9
+        fprintf('%d\t%.1f%%\t\t%.1f%%\t\t%.2f\t\t%.2f\n', ...
+                i, defaultMCSPercent(i+1), minstrelMCSPercent(i+1), ...
+                defaultMCSEff(i+1), minstrelMCSEff(i+1));
+    end
+    
+    % Print throughput values per SNR
+    fprintf('\n----- Throughput per SNR Value -----\n');
+    fprintf('SNR(dB)\tDefault-Mbps\tMinstrel-Mbps\tDefault-Count\tMinstrel-Count\tDifference(%%)\n');
+    for i = 1:length(snrBins)
+        % Calculate percentage difference (if both values exist)
+        if defaultThroughputPerSNR(i) > 0 && minstrelThroughputPerSNR(i) > 0
+            percentDiff = (minstrelThroughputPerSNR(i) / defaultThroughputPerSNR(i) - 1) * 100;
+        else
+            percentDiff = NaN;
+        end
+        
+        % Only print rows that have data
+        if defaultCountPerSNR(i) > 0 || minstrelCountPerSNR(i) > 0
+            fprintf('%d\t%.2f\t\t%.2f\t\t%d\t\t%d\t\t', ...
+                    snrBins(i), defaultThroughputPerSNR(i), minstrelThroughputPerSNR(i), ...
+                    defaultCountPerSNR(i), minstrelCountPerSNR(i));
+            
+            % Print percentage difference if it exists
+            if ~isnan(percentDiff)
+                if percentDiff >= 0
+                    fprintf('+%.2f%%\n', percentDiff);
+                else
+                    fprintf('%.2f%%\n', percentDiff);
+                end
+            else
+                fprintf('N/A\n');
+            end
+        end
+    end
+end
+
+%% Add this call at the end of your script, after the plotComparisonResults call
+
+% Add extended comparison
+plotExtendedComparison(defaultBER, defaultMCS, defaultSNRMeasured, throughputDefault, ...
+                     minstrelBER, minstrelMCS, minstrelSNRMeasured, throughputMinstrel, ...
+                     cfgVHT);
